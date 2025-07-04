@@ -52,15 +52,20 @@ Base = declarative_base()
 
 auction_state = {
     "active": False,
-    "photo_id": None,
+    "https_img": None,
+    "start_time": None,
     "end_time": None,
+    "name": None,
     "start_price": None,
     "step": None,
     "current_price": None,
     "leader_id": None,
     "leader_name": None,
-    "bids": []
+    "bids": [],
+    "rejalashtirildi": False,
+    "started": False
 }
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)s | %(name)s | %(message)s',
@@ -200,11 +205,11 @@ class AdminManageFSM(StatesGroup):
 class AuctionFSM(StatesGroup):
     wait_img = State()
     wait_name = State()
-    wait_time = State()
+    wait_start_time = State()
+    wait_end_time = State()
     wait_start_price = State()
     wait_step = State()
-    confirm = State()
-
+    done = State()
 
 
 # ---- STATIC DATA ----
@@ -219,17 +224,18 @@ SKIN_CATEGORIES = {
 # --- AUCTION STATE ---
 auction_state = {
     "active": False,
+    "started": False,
+    "rejalashtirildi": False,
     "https_img": None,
-    "end_time": None,
     "name": None,
+    "start_time": None,
+    "end_time": None,
     "start_price": None,
     "step": None,
     "current_price": None,
     "leader_id": None,
     "leader_name": None,
-    "bids": [],
-    "rejalashtirildi": False,
-    "started": False
+    "bids": []
 }
 
 # --- KEYBOARDS ---
@@ -314,7 +320,7 @@ def get_all_user_ids():
     return [row[0] for row in rows]
 
 def get_auction_menu():
-    keyboard = ReplyKeyboardMarkup(
+    return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="Auksion yaratish")],
             [KeyboardButton(text="Auksionni rejalashtirish")],
@@ -325,6 +331,11 @@ def get_auction_menu():
         resize_keyboard=True,
     )
     return keyboard
+    
+def get_bid_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(
+            text=f"Narxni oshirish (+{auction_state['step']})", callback_data="bid_raise")]])
 
 
 # --- BOT SETUP ---
@@ -397,6 +408,28 @@ async def cmd_start(message: types.Message, state: FSMContext):
         reply_markup=get_main_menu(message.from_user.id)
     )
     
+# --- SCHEDULER ---
+async def schedule_auction_start(bot, start_time_str):
+    try:
+        dt = datetime.strptime(start_time_str, "%Y-%m-%d %H:%M")
+        delay = (dt - datetime.utcnow()).total_seconds()
+        if delay > 0:
+            await asyncio.sleep(delay)
+        auction_state["active"] = True
+        auction_state["started"] = True
+        await broadcast_auction_start(bot)
+    except Exception as e:
+        print("Start vaqt xato:", e)
+
+async def broadcast_auction_start(bot):
+    kb = get_bid_keyboard()
+    text = (f"🟢 Auksion boshlandi!\nNomi: {auction_state['name']}\nTugash: {auction_state['end_time']}\nNarx: {auction_state['current_price']}\nIshtirok etish uchun tugmani bosing!")
+    for uid in get_all_user_ids():
+        try:
+            await bot.send_photo(chat_id=uid, photo=auction_state['https_img'], caption=text, reply_markup=kb)
+        except:
+            pass
+
 
 @dp.message(F.text == "⬅️ Orqaga")
 async def back_to_menu(message: types.Message, state: FSMContext):
@@ -720,29 +753,52 @@ async def admin_confirm_deposit(message: types.Message):
 @dp.message(F.text == "Auksion")
 async def auction_menu(message: types.Message):
     await get_or_create_user(message.from_user.id)
+
     async with AsyncSessionLocal() as session:
-        result = await session.execute(select(Auction).where(Auction.status == "active"))
+        result = await session.execute(
+            select(Auction).where(Auction.status.in_(["planned", "active"]))
+        )
         auction = result.scalars().first()
+
     if not auction:
         await message.answer("Hozircha auksion mavjud emas.")
         return
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="Narxni oshirish", callback_data="auction_bid")]
-        ]
-    )
-    await message.answer_photo(
-        auction.skin_img,
-        caption=(
-            f"<b>Auksion!</b>\n"
-            f"Boshlang‘ich narx: {auction.start_price:,.0f}\n"
-            f"O‘sish: +{auction.step:,.0f}\n"
-            f"Hozirgi narx: {auction.current_price:,.0f}\n"
-            f"Yutayotgan: {auction.current_winner or 'Hali yo‘q'}\n"
-            f"Tugash vaqti: {auction.end_time}"
-        ),
-        reply_markup=kb
-    )
+
+    if auction.status == "planned":
+        await message.answer_photo(
+            auction.skin_img,
+            caption=(
+                f"<b>Auksion rejalashtirilgan:</b>\n"
+                f"Nomi: {auction.name}\n"
+                f"Boshlanish vaqti: {auction.start_time}\n"
+                f"Tugash vaqti: {auction.end_time}\n"
+                f"Boshlang‘ich narx: {auction.start_price:,.0f}\n"
+                f"O‘sish bosqichi: +{auction.step:,.0f}"
+            ),
+            parse_mode="HTML"
+        )
+        return
+
+    if auction.status == "active":
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="Narxni oshirish", callback_data="auction_bid")]
+            ]
+        )
+        await message.answer_photo(
+            auction.skin_img,
+            caption=(
+                f"<b>Auksion!</b>\n"
+                f"Boshlang‘ich narx: {auction.start_price:,.0f}\n"
+                f"O‘sish: +{auction.step:,.0f}\n"
+                f"Hozirgi narx: {auction.current_price:,.0f}\n"
+                f"Yutayotgan: {auction.current_winner or 'Hali yo‘q'}\n"
+                f"Tugash vaqti: {auction.end_time}"
+            ),
+            reply_markup=kb,
+            parse_mode="HTML"
+        )
+
 
 @dp.callback_query(F.data == "auction_bid")
 async def auction_bid(call: types.CallbackQuery):
@@ -1039,89 +1095,94 @@ async def handle_sell_request_action(callback: types.CallbackQuery):
 
 # --- AUKSION BLOK ---
 @dp.message(F.text == "Auksion boshqarish")
-async def admin_manage_auction(message: types.Message, state: FSMContext):
+async def admin_manage(message: types.Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS and message.from_user.id != SUPER_ADMIN_ID:
         await message.answer("Siz admin emassiz.")
         return
-    await message.answer("Auksion boshqaruv paneli:", reply_markup=get_auction_menu())
-    
+    await message.answer("Auksion paneli:", reply_markup=get_auction_menu())
+
 @dp.message(F.text == "Auksion yaratish")
-async def create_auction_handler(message: types.Message, state: FSMContext):
-    auction_state.update({
-        "active": False, "https_img": None, "end_time": None,
-        "name": None, "start_price": None, "step": None, "current_price": None,
-        "leader_id": None, "leader_name": None, "bids": [],
-        "rejalashtirildi": False, "started": False
-    })
-    await message.answer("Auksion uchun rasm havolasini (https://...) yuboring.")
+async def auction_create(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer("🖼 Rasm (https) havolasini yuboring:")
     await state.set_state(AuctionFSM.wait_img)
 
 @dp.message(AuctionFSM.wait_img)
-async def auction_img_received(message: types.Message, state: FSMContext):
-    url = message.text.strip()
-    if not (url.startswith("http://") or url.startswith("https://")):
-        await message.answer("Faqat https:// yoki http:// bilan boshlanuvchi rasm havolasi yuboring!")
-        return
-    await state.update_data(https_img=url)
+async def step_img(message: types.Message, state: FSMContext):
+    if not message.text.startswith("http"):
+        return await message.answer("❗ Rasm havolasi noto‘g‘ri. https:// bilan boshlanishi kerak.")
+    await state.update_data(https_img=message.text.strip())
+    await message.answer("🎯 Skin nomini yuboring:")
     await state.set_state(AuctionFSM.wait_name)
-    await message.answer("Skin nomini kiriting (masalan: AWP | Dragon Lore):")
 
 @dp.message(AuctionFSM.wait_name)
-async def auction_name_received(message: types.Message, state: FSMContext):
+async def step_name(message: types.Message, state: FSMContext):
     await state.update_data(name=message.text.strip())
-    await state.set_state(AuctionFSM.wait_time)
-    await message.answer("Auksion tugash vaqtini kiriting (masalan: 2025-06-29 20:00):")
+    await message.answer("🕒 Boshlanish vaqtini kiriting (masalan: 2025-07-04 17:00):")
+    await state.set_state(AuctionFSM.wait_start_time)
 
-@dp.message(AuctionFSM.wait_time)
-async def auction_time_received(message: types.Message, state: FSMContext):
+@dp.message(AuctionFSM.wait_start_time)
+async def step_start_time(message: types.Message, state: FSMContext):
+    await state.update_data(start_time=message.text.strip())
+    await message.answer("🕓 Tugash vaqtini kiriting (masalan: 2025-07-04 18:00):")
+    await state.set_state(AuctionFSM.wait_end_time)
+
+@dp.message(AuctionFSM.wait_end_time)
+async def step_end_time(message: types.Message, state: FSMContext):
     await state.update_data(end_time=message.text.strip())
+    await message.answer("💰 Boshlang‘ich narxni kiriting (faqat son):")
     await state.set_state(AuctionFSM.wait_start_price)
-    await message.answer("Boshlang‘ich narxni kiriting:")
 
 @dp.message(AuctionFSM.wait_start_price)
-async def auction_start_price_received(message: types.Message, state: FSMContext):
+async def step_price(message: types.Message, state: FSMContext):
     try:
         price = float(message.text.strip())
         await state.update_data(start_price=price)
+        await message.answer("📈 Narx oshish bosqichini kiriting (faqat son):")
         await state.set_state(AuctionFSM.wait_step)
-        await message.answer("Auksion narx oshish bosqichini kiriting (masalan: 10000):")
-    except Exception:
-        await message.answer("Narxni faqat son shaklida kiriting!")
+    except:
+        await message.answer("❗ Faqat raqam kiriting!")
 
 @dp.message(AuctionFSM.wait_step)
-async def auction_step_received(message: types.Message, state: FSMContext):
+async def step_step(message: types.Message, state: FSMContext):
     try:
         step = float(message.text.strip())
-        data = await state.get_data()
         await state.update_data(step=step)
-        await state.set_state(AuctionFSM.confirm)
+        data = await state.get_data()
+
         await message.answer_photo(
             data['https_img'],
             caption=(
-                f"Auksion:\nNomi: {data['name']}\n"
-                f"Tugash vaqti: {data['end_time']}\n"
-                f"Boshlang‘ich narx: {data['start_price']:,.0f}\n"
-                f"O‘sish bosqichi: {step:,.0f}\n"
-                f"Auksionni rejalashtirish uchun 'Auksionni rejalashtirish' tugmasini bosing."
+                f"<b>✅ Auksion tayyor:</b>\n"
+                f"Nomi: {data['name']}\n"
+                f"Boshlanish: {data['start_time']}\n"
+                f"Tugash: {data['end_time']}\n"
+                f"Boshlang‘ich narx: {data['start_price']}\n"
+                f"O‘sish bosqichi: {step}"
             ),
-            reply_markup=get_auction_menu()
+            reply_markup=get_auction_menu(),
+            parse_mode="HTML"
         )
-    except Exception:
-        await message.answer("Stepni faqat son shaklida kiriting!")
+        await state.set_state(AuctionFSM.done)
+    except:
+        await message.answer("❗ Stepni faqat raqam shaklida kiriting!")
 
 @dp.message(F.text == "Auksionni rejalashtirish")
-async def auction_plan_handler(message: types.Message, state: FSMContext):
+async def auction_plan(message: types.Message, state: FSMContext):
     data = await state.get_data()
-    if not data or not data.get("https_img"):
-        await message.answer("Avval auksion uchun ma'lumotlarni to'liq kiriting!")
+    required = ['https_img', 'name', 'start_time', 'end_time', 'start_price', 'step']
+    if not all(data.get(k) for k in required):
+        await message.answer("⚠️ Avval barcha maydonlarni to‘ldiring.")
         return
+
     auction_state.update({
         "https_img": data['https_img'],
-        "end_time": data['end_time'],
         "name": data['name'],
-        "start_price": float(data['start_price']),
-        "step": float(data['step']),
-        "current_price": float(data['start_price']),
+        "start_time": data['start_time'],
+        "end_time": data['end_time'],
+        "start_price": data['start_price'],
+        "step": data['step'],
+        "current_price": data['start_price'],
         "rejalashtirildi": True,
         "active": False,
         "started": False,
@@ -1129,7 +1190,11 @@ async def auction_plan_handler(message: types.Message, state: FSMContext):
         "leader_name": None,
         "bids": []
     })
-    await message.answer("Auksion rejalashtirildi! Boshlash uchun 'Auksionni boshlash' tugmasini bosing.", reply_markup=get_auction_menu())
+
+    await message.answer("✅ Auksion rejalashtirildi! Avtomatik boshlanadi.")
+    await state.clear()
+    asyncio.create_task(schedule_auction_start(message.bot, auction_state['start_time']))
+
 
 @dp.message(F.text == "Auksionni boshlash")
 async def start_auction_handler(message: types.Message, state: FSMContext):
@@ -1166,30 +1231,57 @@ async def start_auction_handler(message: types.Message, state: FSMContext):
     asyncio.create_task(auction_finish_timer(message.bot, auction_state["end_time"]))
 
 @dp.message(F.text == "Auksion")
-async def auction_menu(message: types.Message):
-    if not auction_state["started"]:
+async def auction_view(message: types.Message):
+    if auction_state["started"]:
+        leader = auction_state['leader_name'] or "Yo‘q"
+        await message.answer_photo(
+            auction_state['https_img'],
+            caption=(
+                f"<b>Auksion:</b>\n"
+                f"Nomi: {auction_state['name']}\n"
+                f"Boshlang‘ich: {auction_state['start_price']}\n"
+                f"Hozirgi: {auction_state['current_price']}\n"
+                f"Yutayotgan: {leader}\n"
+                f"Tugash: {auction_state['end_time']}"
+            ),
+            reply_markup=get_bid_keyboard(),
+            parse_mode="HTML"
+        )
+    elif auction_state["rejalashtirildi"] and auction_state["start_time"]:
+        await message.answer_photo(
+            auction_state['https_img'],
+            caption=(
+                f"<b>Auksion rejalashtirilgan:</b>\n"
+                f"Nomi: {auction_state['name']}\n"
+                f"Boshlanish: {auction_state['start_time']}\n"
+                f"Tugash: {auction_state['end_time']}\n"
+                f"Boshlang‘ich narx: {auction_state['start_price']}\n"
+                f"Step: {auction_state['step']}"
+            ),
+            parse_mode="HTML"
+        )
+    else:
         await message.answer("Hozircha auksion mavjud emas.")
-        return
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="Narxni oshirish", callback_data="bid_raise")]
-        ]
-    )
-    leader = auction_state["leader_name"] or "Hali yo‘q"
-    await message.answer_photo(
-        auction_state["https_img"],
-        caption=(
-            f"<b>Auksion!</b>\n"
-            f"Nomi: {auction_state['name']}\n"
-            f"Boshlang‘ich narx: {auction_state['start_price']:,.0f}\n"
-            f"O‘sish: +{auction_state['step']:,.0f}\n"
-            f"Hozirgi narx: {auction_state['current_price']:,.0f}\n"
-            f"Yutayotgan: {leader}\n"
-            f"Tugash vaqti: {auction_state['end_time']}"
-        ),
-        reply_markup=kb,
-        parse_mode="HTML"
-    )
+
+
+@dp.callback_query(F.data == "bid_raise")
+async def raise_bid(call: types.CallbackQuery):
+    if not auction_state["active"]:
+        return await call.answer("Auksion tugagan yoki boshlanmagan!", show_alert=True)
+    uid = call.from_user.id
+    if auction_state['leader_id'] == uid:
+        return await call.answer("Siz allaqachon lider ekansiz!", show_alert=True)
+    bal = await get_user_balance(uid)
+    new_price = auction_state['current_price'] + auction_state['step']
+    if bal < new_price:
+        return await call.answer("Balans yetarli emas!", show_alert=True)
+    auction_state.update({
+        "current_price": new_price,
+        "leader_id": uid,
+        "leader_name": call.from_user.full_name,
+    })
+    auction_state['bids'].append({"user_id": uid, "user_name": call.from_user.full_name, "price": new_price})
+    await call.answer("Narx oshirildi!")
 
 @dp.message(F.text == "Auksionni to‘xtatish")
 async def stop_auction_handler(message: types.Message):
